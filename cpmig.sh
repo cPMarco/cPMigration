@@ -5,12 +5,13 @@
 #
 # README
 # https://raw.github.com/philstark/cPMigration/DEVELOPMENT/README.md
+# https://raw.githubusercontent.com/CpanelInc/cPMigration/PUBLIC/README.md
 #
 # https://github.com/philstark/cPMigration/
 #
-VERSION="1.1.5"
+VERSION="1.1.7"
 scripthome="/root/.cpmig"
-giturl="https://raw.github.com/CpanelInc/cPMigration/PUBLIC"
+giturl="https://raw.githubusercontent.com/CpanelInc/cPMigration/PUBLIC/cpmig.sh"
 #
 #############################################
 
@@ -40,8 +41,10 @@ print_help(){
   echo '-k keep archives on both servers'
   echo '-D use DEVEL scripts on remote setup (3rdparty)'
   echo '-S skip remote setup'
+  echo '-c skip security check'
   echo '-h displays this dialogue'
   echo '-R <destip>, Set up Remote MySQL grants for destination ip (cPanel > cPanel migration only)'
+  echo '-e pr[e]-cpmig. Copy files for [e]valuation only. no migration is performed'
   echo; echo; exit 1
 }
 
@@ -90,6 +93,118 @@ set_logging_mode(){
   esac
 }
 
+# Libkey Check
+lc_checkfor() {
+    if [ "$1" ];
+        then echo -e "$2\n$1\n$3" >> $logfile;
+        lc_num_fails=$((lc_num_fails+1))
+        else echo "Passed." >> $logfile
+    fi
+}
+
+lc_print_header() {
+    echo -e "\nSearching for Libkey compromise. The '6 commands' are described here:\n
+http://docs.cpanel.net/twiki/bin/view/AllDocumentation/CompSystem" >> $logfile
+lc_num_fails=0
+}
+
+# Libkey Check: These general checks are not the 6 commands listed on the website
+lc_general_checks() {
+    echo -e "\nFirst general checks:"  >> $logfile
+    libkey_ver_check=$(\ls -la $(ldd $(which sshd) |grep libkey | cut -d" " -f3))
+    #length_check $libkey_ver_check
+    libkey_check_results=$(echo $libkey_ver_check | egrep "1.9|1.3.2|1.3.0|1.2.so.2|1.2.so.0")
+    lc_checkfor "$libkey_check_results" "libkey check failed due to version number: "
+
+    libkey_dir=$(echo $libkey_ver_check | cut -d"/" -f2)
+    libkey_ver=$(echo $libkey_ver_check |grep libkey | awk '{print $NF}')
+    thelibkey=$(echo "/"$libkey_dir"/"$libkey_ver)
+    assiciated_rpm=$(rpm -qf $thelibkey)
+
+    assiciated_rpm_check=$(echo $assiciated_rpm | grep "is not owned by any package")
+    if [ "$assiciated_rpm_check" ]; then
+        echo -e "libkey check failed due to associated RPM:\n"$assiciated_rpm >> $logfile
+        lc_num_fails=$((lc_num_fails+1))
+    else
+        echo -e "RPM associated with libkey file:\n"$assiciated_rpm >> $logfile
+        echo "Passed." >> $logfile
+    fi
+}
+
+# Libkey Check: Here the 6 commands listed on the website 
+lc_command_1() {
+    echo -e "\nCommand 1 Test:" >> $logfile
+    keyu_pckg_chg_test=$(rpm -V keyutils-libs)
+    lc_checkfor "$keyu_pckg_chg_test" "keyutils-libs check failed. The rpm shows the following file changes: " "\n If the above changes are any of the 
+ following, then maybe it's ok (probable false positive - you could ask the sysadmin what actions may have caused these):
+ .M.....T
+ However, if changes are any of the following, then it's definitely suspicious:
+ S.5.L...
+ see 'man rpm' and look for 'Each of the 8 characters'" >> $logfile
+}
+
+lc_command_2() {
+    echo -e "\nCommand 2 Test:" >> $logfile
+    cmd_2_chk=$(\ls -la $thelibkey | egrep "so.1.9|so.1.3.2|1.2.so.2");
+    lc_checkfor "$cmd_2_chk" "Known bad package check failed. The following file is linked to libkeyutils.so.1: "
+}
+
+lc_command_3() {
+    echo -e "\nCommand 3 Test:" >> $logfile
+    cmd_3_chk=$(strings $thelibkey | egrep 'connect|socket|inet_ntoa|gethostbyname')
+    lc_checkfor "$cmd_3_chk" "libkeyutils libraries contain networking tools: "
+}
+
+lc_command_4() {
+    echo -e "\nCommand 4 Test:" >> $logfile
+    check_ipcs_lk=$(for i in `ipcs -mp | grep -v cpid | awk {'print $3'} | uniq`; do ps aux | grep '\b'$i'\b' | grep -v grep;done | grep -i ssh)
+    lc_checkfor "$check_ipcs_lk" "IPCS Check failed.  This is sometimes a false positive:"
+}
+
+lc_command_5() {
+    echo -e "\nCommand 5 Test is not designed to run by this automated script" >> $logfile
+}
+
+lc_command_6() {
+    echo -e "\nCommand 6 Test:" >> $logfile
+    cmd6fail=0
+    for i in $(ldd /usr/sbin/sshd | cut -d" " -f3); do
+        sshd_library=$(rpm -qf $i);
+        if [ ! "sshd_library" ]; then
+            echo -e "\n"$i" has no associated library." >> $logfile
+            echo $sshd_library >> $logfile
+            cmd6fail=$((cmd6fail+1))
+        fi;
+    done
+    if [ "$cmd6fail" -gt 0 ]; then
+        lc_num_fails=$((lc_num_fails+1))
+    else echo "Passed." >> $logfile
+    fi
+}
+
+
+# Libkey Check: Print Summary and show the dates on the files
+lc_summary() {
+    if [ "$lc_num_fails" -gt 0 ]; then
+        echo -e "\nPossible change times of the compromised files:" >> $logfile
+        for i in $(\ls /lib*/libkeyutils*); do
+            cmd_3_chk=$(strings $i | egrep 'connect|socket|inet_ntoa|gethostbyname');
+            if [ "$cmd_3_chk" ]; then
+                stat $i | grep -i change >> $logfile;
+            fi;
+        done
+        echo -e "\nTotal Number of checks failed: "$lc_num_fails" (out of 7 checks currently)\n\n
+The following is a general guide to interpret results:
+  1 check failed = probably false positive. This is usually commands 1, 4, or 6
+  2 checks failed = somewhat likely real
+  3+ checks failed = definitely real\n\n" >> $logfile
+
+    echo -e "Destination server failed a critical error check.  See logs for more details:\n\n$logfile\n\n"  &> >(tee --append $logfile)
+    exit 0
+    fi
+
+}
+
 setup_remote(){
   if [[ $develmode == "1" ]]; then
     echo "DEVEL Mode set for setup_remote" &> >(tee --append $logfile)
@@ -98,61 +213,246 @@ setup_remote(){
     pkgacctbranch="PUBLIC" &> >(tee --append $logfile)
   fi
   
-  control_panel=`$ssh root@$sourceserver "if [ -e /usr/local/psa/version	 ];then echo plesk; elif [ -e /usr/local/cpanel/cpanel ];then echo cpanel; elif [ -e /usr/bin/getapplversion ];then echo ensim; elif [ -e /usr/local/directadmin/directadmin ];then echo da; else echo unknown;fi;exit"` >> $logfile 2>&1
-  #echo "Checking remote server control panel: $control_panel"
-  #echo "CONTROL PANEL: $control_panel"
-  if [[ $control_panel = "cpanel" ]]; then : echo "Source is cPanel,  nothing special to do"  # no need to bring over things if cPanel#
-    elif [[ $control_panel = "plesk" ]]; then  # wget or curl from httpupdate
-    echo "The Source server is Plesk!"  &> >(tee --append $logfile)
-    echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
-    $ssh root@$sourceserver "
-if [[ ! -d /scripts ]]; then
-mkdir /scripts ;fi;
-if [[ ! -f /scripts/pkgacct ]]; then
-wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-pXa -P /scripts;
-mv /scripts/pkgacct-pXa /scripts/pkgacct;
-chmod 755 /scripts/pkgacct
-fi;
-if [[ ! -f /scripts/updateuserdomains-universal ]]; then
-wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
-chmod 755 /scripts/updateuserdomains-universal;
-fi;
-    /scripts/updateuserdomains-universal;" >> $logfile 2>&1
-    elif [[ $control_panel = "ensim" ]]; then
-    echo "The Source server is Ensim!"  &> >(tee --append $logfile)
-    echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
-    $ssh root@$sourceserver "
-if [[ ! -d /scripts ]]; then
-mkdir /scripts ;fi;
-if [[ ! -f /scripts/pkgacct ]]; then
-wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-enXim -P /scripts;
-mv /scripts/pkgacct-enXim /scripts/pkgacct;
-chmod 755 /scripts/pkgacct
-fi;
-if [[ ! -f /scripts/updateuserdomains-universal ]]; then
-wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
-chmod 755 /scripts/updateuserdomains-universal;
-fi;
-    /scripts/updateuserdomains-universal;" >> $logfile 2>&1
-    elif [[ $control_panel = "da" ]]; then
-    echo "The Source server is Direct Admin!"  &> >(tee --append $logfile)
-    echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
-    $ssh root@$sourceserver "
-if [[ ! -d /scripts ]]; then
-mkdir /scripts ;fi;
-if [[ ! -f /scripts/pkgacct ]]; then
-wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-dXa -P /scripts;
-mv /scripts/pkgacct-dXa /scripts/pkgacct;
-chmod 755 /scripts/pkgacct
-fi;
-if [[ ! -f /scripts/updateuserdomains-universal ]]; then
-wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
-chmod 755 /scripts/updateuserdomains-universal;
-fi;
-    /scripts/updateuserdomains-universal;" >> $logfile 2>&1
+  control_panel=`$ssh root@$sourceserver "if [ -e /usr/local/psa/version     ];then echo plesk; elif [ -e /usr/local/cpanel/cpanel ];then echo cpanel; elif [ -e /usr/bin/getapplversion ];then echo ensim; elif [ -e /usr/local/directadmin/directadmin ];then echo da; else echo unknown;fi;exit"` >> $logfile 2>&1
+
+  #############################################
+  ### Pre-cPMig
+  #############################################
+  ### To be run as a pre-migration evaluation
+  #############################################
+  eval_folder=evalfiles.$sourceserver
+
+  if [[ $precpmig = "1" ]]; then
+      echo -e "\n\nPre-cPMigration invoked.  This will not copy any accounts, just the evaluation files.\n\n" &> >(tee --append $logfile)
+  
+      cpeval_location=https://raw.githubusercontent.com/cPanelMigrations/cpeval2/master/cpeval2
+      the_date=$(date +%Y%m%d).$(date +%H).$(date +%M)
+      eval_folder=evalfiles.$sourceserver
+  
+      setup_scripts_plesk_cmds="
+          if [[ ! -d /scripts ]]; then
+              mkdir /scripts ;fi;
+          if [[ ! -f /scripts/pkgacct ]]; then
+              wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-pXa -P /scripts;
+              mv /scripts/pkgacct-pXa /scripts/pkgacct;
+              chmod 755 /scripts/pkgacct
+          fi;
+          if [[ ! -f /scripts/updateuserdomains-universal ]]; then
+              wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
+              chmod 755 /scripts/updateuserdomains-universal;
+          fi;
+          /scripts/updateuserdomains-universal;
+      "
+  
+      setup_scripts_ensim_cmds="
+          if [[ ! -d /scripts ]]; then 
+              mkdir /scripts ;fi; 
+          if [[ ! -f /scripts/pkgacct ]]; then 
+              wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-enXim -P /scripts;
+              mv /scripts/pkgacct-enXim /scripts/pkgacct;
+              chmod 755 /scripts/pkgacct
+          fi;
+          if [[ ! -f /scripts/updateuserdomains-universal ]]; then
+              wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
+              chmod 755 /scripts/updateuserdomains-universal;
+          fi;
+          /scripts/updateuserdomains-universal;
+      "
+  
+      setup_scripts_da_cmds="
+          if [[ ! -d /scripts ]]; then 
+              mkdir /scripts ;fi; 
+          if [[ ! -f /scripts/pkgacct ]]; then 
+          wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-dXa -P /scripts;
+          mv /scripts/pkgacct-dXa /scripts/pkgacct;
+          chmod 755 /scripts/pkgacct
+              fi;
+              if [[ ! -f /scripts/updateuserdomains-universal ]]; then
+          wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
+          chmod 755 /scripts/updateuserdomains-universal;
+          fi;
+          /scripts/updateuserdomains-universal;
+      "
+  
+      createscripthome_cmds="
+          # Pre-cPMigration Files
+          mkdir -v $scripthome; mkdir -v $scripthome/$eval_folder;
+      "
+  
+      cpanel_specific_cmds="
+          cat /var/cpanel/cpanel.config | sort | awk NF > $scripthome/$eval_folder/source.cpanel.config
+          cp -pv /etc/my.cnf $scripthome/$eval_folder/
+          cp -pv /usr/local/lib/php.ini $scripthome/$eval_folder/
+          cp -pv /var/cpanel/easy/apache/profile/_main.yaml $scripthome/$eval_folder/
+          cp -pv /var/cpanel/easy/apache/prefs.yaml $scripthome/$eval_folder/
+          cp -pv /etc/exim.conf $scripthome/$eval_folder/
+      "
+  
+      post_setup_cmds1="
+          curl -s --insecure $cpeval_location | perl > $scripthome/$eval_folder/source.eval.out
+      "
+  
+      post_setup_cmds2_cpanel="
+          grep '^d:' $scripthome/$eval_folder/source.eval.out | sed 's/^d:/s:Ensim:/' > $scripthome/$eval_folder/eval.in
+          tar -czvf $scripthome/cPprefiles.$the_date.tar.gz $scripthome/$eval_folder/
+      "
+  
+      post_setup_cmds2_other="
+          grep '^s:' $scripthome/$eval_folder/source.eval.out > $scripthome/$eval_folder/eval.in
+          tar -czvf $scripthome/cPprefiles.$the_date.tar.gz $scripthome/$eval_folder/
+      "
+  
+      dest_post_premigfilexfer_cmds() {
+          if [ -e $scripthome/cPprefiles.$the_date.tar.gz ]; then
+              echo -e "\nFile transfer complete, now unpacking locally\n" &> >(tee --append $logfile)
+          else echo -e "\nError with file transfer, see logs\n" &> >(tee --append $logfile)
+          fi
+          tar -C / -xzf $scripthome/cPprefiles.$the_date.tar.gz
+          rm $scripthome/cPprefiles.$the_date.tar.gz
+          mkdir -v $scripthome/$eval_folder 2>>$logfile
+          curl -s --insecure $cpeval_location | perl > $scripthome/$eval_folder/destination.eval.out
+          cat /var/cpanel/cpanel.config | sort | awk NF > $scripthome/$eval_folder/destination.cpanel.config
+          grep ^d: $scripthome/$eval_folder/destination.eval.out >> $scripthome/$eval_folder/eval.in
+  
+          echo -e "Running cpeval on the input file: $scripthome/$eval_folder/eval.in\n\n" &> >(tee --append $logfile)
+          curl -s --insecure $cpeval_location | perl /dev/stdin $scripthome/$eval_folder/eval.in &> >(tee --append $logfile)
+          echo -e "\n\n" &> >(tee --append $logfile)
+          echo -e "\nYou can also use:\ndiff -y --suppress-common-lines $scripthome/$eval_folder/source.eval.out $scripthome/$eval_folder/destination.eval.out | less\n\n" &> >(tee --append $logfile)
+          echo -e "\n\nTransfer of pre-migration, evaluation files complete. See output in:\n$scripthome/$eval_folder\n\n" &> >(tee --append $logfile)
+      }
+  
+      if [[ $control_panel = "cpanel" ]]; then
+         echo "Source is cPanel"
+         echo "The Source server is cPanel"  &> >(tee --append $logfile)
+         echo -e "\nCollecting files on source server (should take > 10s)\n" &> >(tee --append $logfile)
+  
+         $ssh root@$sourceserver "
+         $setup_scripts_cmds
+         $createscripthome_cmds
+         $cpanel_specific_cmds
+         $post_setup_cmds1
+         $post_setup_cmds2_cpanel
+         " >> $logfile 2>&1
+  
+         #Adding a log marker, copy the files over
+         logcheck="$logcheck `echo \"Transferring pre-migration files\" &> >(tee --append $logfile)`"
+         logcheck="$logcheck `$scp root@$sourceserver:$scripthome/cPprefiles.$the_date.tar.gz $scripthome/cPprefiles.$the_date.tar.gz &> >(tee --append $logfile)`"
+         dest_post_premigfilexfer_cmds
+  
+      elif [[ $control_panel = "plesk" ]]; then
+         echo "The Source server is Plesk"  &> >(tee --append $logfile)
+         echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
+  
+         $ssh root@$sourceserver "
+         $setup_scripts_plesk_cmds
+         $createscripthome_cmds
+         $post_setup_cmds1
+         $post_setup_cmds2_other
+         " >> $logfile 2>&1
+  
+         #Adding a log marker, copy the files over
+         logcheck="$logcheck `echo \"Transferring pre-migration files\" &> >(tee --append $logfile)`"
+         logcheck="$logcheck `$scp root@$sourceserver:$scripthome/cPprefiles.$the_date.tar.gz $scripthome/cPprefiles.$the_date.tar.gz &> >(tee --append $logfile)`"
+         dest_post_premigfilexfer_cmds
+  
+      elif [[ $control_panel = "ensim" ]]; then
+         echo "The Source server is Ensim"  &> >(tee --append $logfile)
+         echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
+  
+         $ssh root@$sourceserver "
+         $setup_scripts_ensim_cmds
+         $createscripthome_cmds
+         $post_setup_cmds1
+         $post_setup_cmds2_other
+  
+         " >> $logfile 2>&1
+  
+         #Adding a log marker, copy the files over
+         logcheck="$logcheck `echo \"Transferring pre-migration files\" &> >(tee --append $logfile)`"
+         logcheck="$logcheck `$scp root@$sourceserver:$scripthome/cPprefiles.$the_date.tar.gz $scripthome/cPprefiles.$the_date.tar.gz &> >(tee --append $logfile)`"
+         dest_post_premigfilexfer_cmds
+  
+      elif [[ $control_panel = "da" ]]; then
+         echo "The Source server is DA"  &> >(tee --append $logfile)
+         echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
+  
+         $ssh root@$sourceserver "
+         $setup_scripts_da_cmds
+         $createscripthome_cmds
+         $post_setup_cmds1
+         $post_setup_cmds2_other
+  
+         " >> $logfile 2>&1
+  
+         #Adding a log marker, copy the files over
+         logcheck="$logcheck `echo \"Transferring pre-migration files\" &> >(tee --append $logfile)`"
+         logcheck="$logcheck `$scp root@$sourceserver:$scripthome/cPprefiles.$the_date.tar.gz $scripthome/cPprefiles.$the_date.tar.gz &> >(tee --append $logfile)`"
+         dest_post_premigfilexfer_cmds
+  
+      else echo -e "\nError in Panel Identification - None found\n" &> >(tee --append $logfile)
+      fi
+
+  #############################################
+  ### Standard Remote Setup
+  #############################################
+  elif [[ $precpmig != "1" ]]; then
+  #else
+      #echo "Checking remote server control panel: $control_panel"
+      #echo "CONTROL PANEL: $control_panel"
+      if [[ $control_panel = "cpanel" ]]; then : echo "Source is cPanel,  nothing special to do"  # no need to bring over things if cPanel#
+        elif [[ $control_panel = "plesk" ]]; then  # wget or curl from httpupdate
+        echo "The Source server is Plesk!"  &> >(tee --append $logfile)
+        echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
+        $ssh root@$sourceserver "
+    if [[ ! -d /scripts ]]; then
+    mkdir /scripts ;fi;
+    if [[ ! -f /scripts/pkgacct ]]; then
+    wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-pXa -P /scripts;
+    mv /scripts/pkgacct-pXa /scripts/pkgacct;
+    chmod 755 /scripts/pkgacct
+    fi;
+    if [[ ! -f /scripts/updateuserdomains-universal ]]; then
+    wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
+    chmod 755 /scripts/updateuserdomains-universal;
+    fi;
+        /scripts/updateuserdomains-universal;" >> $logfile 2>&1
+        elif [[ $control_panel = "ensim" ]]; then
+        echo "The Source server is Ensim!"  &> >(tee --append $logfile)
+        echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
+        $ssh root@$sourceserver "
+    if [[ ! -d /scripts ]]; then
+    mkdir /scripts ;fi;
+    if [[ ! -f /scripts/pkgacct ]]; then
+    wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-enXim -P /scripts;
+    mv /scripts/pkgacct-enXim /scripts/pkgacct;
+    chmod 755 /scripts/pkgacct
+    fi;
+    if [[ ! -f /scripts/updateuserdomains-universal ]]; then
+    wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
+    chmod 755 /scripts/updateuserdomains-universal;
+    fi;
+        /scripts/updateuserdomains-universal;" >> $logfile 2>&1
+        elif [[ $control_panel = "da" ]]; then
+        echo "The Source server is Direct Admin!"  &> >(tee --append $logfile)
+        echo "Setting up scripts, Updating user domains" &> >(tee --append $logfile)
+        $ssh root@$sourceserver "
+    if [[ ! -d /scripts ]]; then
+    mkdir /scripts ;fi;
+    if [[ ! -f /scripts/pkgacct ]]; then
+    wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/pkgacct-dXa -P /scripts;
+    mv /scripts/pkgacct-dXa /scripts/pkgacct;
+    chmod 755 /scripts/pkgacct
+    fi;
+    if [[ ! -f /scripts/updateuserdomains-universal ]]; then
+    wget http://httpupdate.cpanel.net/cpanelsync/transfers_$pkgacctbranch/pkgacct/updateuserdomains-universal -P /scripts;
+    chmod 755 /scripts/updateuserdomains-universal;
+    fi;
+        /scripts/updateuserdomains-universal;" >> $logfile 2>&1
+      fi
+
+  else echo -e "\nError in Pre Identification\n" &> >(tee --append $logfile)
   fi
 }
-
 
 process_loop(){
   
@@ -417,7 +717,7 @@ after_action_report(){
 ### get options
 #############################################
 
-while getopts ":s:p:a:i:l:kDhSR:" opt; do
+while getopts ":s:p:a:i:l:kDechSR:" opt; do
   case $opt in
     s) sourceserver="$OPTARG";;
     p) sourceport="$OPTARG";;
@@ -427,6 +727,8 @@ while getopts ":s:p:a:i:l:kDhSR:" opt; do
     k) keeparchives=1;;
     D) develmode="1";;
     S) skipremotesetup="1";;
+    e) precpmig="1";;
+    c) skipsecuritycheck=1;;
     h) print_help;;
     R) remotemysql="1";grantip="$OPTARG";;
     \?) echo "invalid option: -$OPTARG"; echo; print_help;;
@@ -490,6 +792,20 @@ epoch=`date +%s`
 
 # Set logging mode
 set_logging_mode
+
+# libkey check
+if [[ $skipsecuritycheck != "1" ]]; then
+  lc_print_header
+  lc_general_checks
+  lc_command_1
+  lc_command_2
+  lc_command_3
+  lc_command_4
+  lc_command_5
+  lc_command_6
+  lc_summary
+  error_check
+fi
 
 # Setup Remote Server
 if [[ $skipremotesetup == "1" ]]; then
